@@ -35,6 +35,15 @@
 #include "platform_esp32.h"
 #include "trace.h"
 #include "tools.h"
+
+#include "audio_controls.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#define UART_PORT_NUM 1
+#define BUF_SIZE 128
+
+static TimerHandle_t polled_uart_timer;
+
 static const char TAG[] = "http_server";
 
 EXT_RAM_ATTR static httpd_handle_t _server;
@@ -45,6 +54,49 @@ EXT_RAM_ATTR RingbufHandle_t messaging;
 httpd_handle_t http_get_server(int *port) {
 	if (port) *port = _port;
 	return _server;
+}
+
+uint8_t buf[BUF_SIZE] = { 0 };
+uint8_t data[BUF_SIZE] = { 0 };
+
+static esp_err_t remote_handler(httpd_req_t *req)
+{
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    ws_pkt.payload = buf;
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, BUF_SIZE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
+        return ret;
+    }
+    ESP_LOGI(TAG, "Got packet with message: %s", ws_pkt.payload);
+
+	buf[ws_pkt.len] = '\0';
+	const char *cmd = (const char *)buf;
+	if (strstr(cmd, "Button")!=NULL) {
+		// Button command
+		uint16_t addr = 30345;
+		if (strstr(cmd, "Play")!=NULL) {
+			uint16_t cmd = 4335;
+			actrls_ir_action(addr, cmd);
+		} else if (strstr(cmd, "Pause")!=NULL) {
+			uint16_t cmd = 8415;
+			actrls_ir_action(addr, cmd);
+		} else if (strstr(cmd, "Prev")!=NULL) { 
+			uint16_t cmd = 49215;
+			actrls_ir_action(addr, cmd);
+		} else if (strstr(cmd, "Next")!=NULL) { 
+			uint16_t cmd = 41055;
+			actrls_ir_action(addr, cmd);
+		}
+	} else {
+		// NAD remote command
+		uart_write_bytes(UART_PORT_NUM, (const char *) buf, ws_pkt.len);
+		//ESP_LOGI(TAG, "sending to NAD: %i", sent);
+	}
+
+    return ret;
 }
 
 void register_common_handlers(httpd_handle_t server){
@@ -60,6 +112,9 @@ void register_common_handlers(httpd_handle_t server){
 void register_regular_handlers(httpd_handle_t server){
 	httpd_uri_t root_get = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = rest_context };
 	httpd_register_uri_handler(server, &root_get);
+
+	httpd_uri_t ws = {.uri = "/ws", .method = HTTP_GET, .handler = remote_handler, .user_ctx = NULL, .is_websocket = true};
+	httpd_register_uri_handler(server, &ws);
 
 	httpd_uri_t ap_get = { .uri = "/ap.json", .method = HTTP_GET, .handler = ap_get_handler, .user_ctx = rest_context };
 	httpd_register_uri_handler(server, &ap_get);
@@ -130,6 +185,38 @@ void register_regular_handlers(httpd_handle_t server){
 
 }
 
+static void uart_polling( TimerHandle_t xTimer ) {
+	int len = uart_read_bytes(UART_PORT_NUM, data, (BUF_SIZE), 20 / portTICK_PERIOD_MS);
+    if (len) {
+        //data[len] = '\0';
+        //ESP_LOGI(TAG, "<- %s", (char *) data);
+
+		// trying to send it to all clients
+		int client_fds[10];
+		size_t fds = 10;
+		esp_err_t err = httpd_get_client_list(_server, &fds, client_fds);
+		if (err != ESP_OK){
+    		ESP_LOGE_LOC(TAG, "Failed to get client list");
+    	} else {
+			httpd_ws_frame_t ws_pkt;
+    		memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    		ws_pkt.payload = data;
+    		ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+			ws_pkt.fragmented = false;
+			ws_pkt.len = len;
+			for (int i=0; i<fds; i++) {
+				int fd = client_fds[i];
+				if (httpd_ws_get_fd_info(_server, fd) == HTTPD_WS_CLIENT_WEBSOCKET) {
+					ESP_LOGI(TAG, "sending data to remote");
+					err = httpd_ws_send_frame_async(_server, fd, &ws_pkt);
+					if (err != ESP_OK){
+						ESP_LOGE_LOC(TAG, "Failed to send frame");
+					}
+				}
+			}
+		}
+	}
+}
 
 esp_err_t http_server_start()
 {
@@ -170,6 +257,9 @@ esp_err_t http_server_start()
 		MEMTRACE_PRINT_DELTA_MESSAGE("HTTP Server regular handlers registered");
     }
 
+	polled_uart_timer = xTimerCreate("uart polling", 100 / portTICK_RATE_MS, pdTRUE, NULL, uart_polling);		
+	xTimerStart(polled_uart_timer, portMAX_DELAY);
+
     return err;
 }
 
@@ -185,6 +275,7 @@ void adder_free_func(void *ctx)
 void stop_webserver(httpd_handle_t server)
 {
     // Stop the httpd server
+	xTimerStop(polled_uart_timer, 0);
     httpd_stop(server);
 }
 

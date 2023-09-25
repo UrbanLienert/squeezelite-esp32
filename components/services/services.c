@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "esp_log.h"
+#include "driver/uart.h"
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 #include "driver/gpio.h"
@@ -26,6 +27,9 @@
 #include "messaging.h"
 #include "buttons.h"
 #include "services.h"
+
+#define UART_BUF_SIZE (512)
+#define UART_PORT_NUM 1
 
 extern void battery_svc_init(void);
 extern void monitor_svc_init(void);
@@ -362,6 +366,24 @@ void services_init(void) {
 
 	// set potential power GPIO on chip first in case expanders are power using these
 	parse_set_GPIO(set_chip_power_gpio);
+
+	// UART for NAD remote control
+
+	ESP_LOGI(TAG,"Configuring UART for NAD remote control");
+
+	uart_config_t uart_config = {
+		.baud_rate = 115200,
+		.data_bits = UART_DATA_8_BITS,
+		.parity    = UART_PARITY_DISABLE,
+		.stop_bits = UART_STOP_BITS_1,
+		.flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+		.source_clk = UART_SCLK_APB,
+	};
+	int intr_alloc_flags = 0;
+
+	ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_BUF_SIZE * 2, 0, 0, NULL, intr_alloc_flags));
+	ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
+	ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, 12, 27, -1, -1));
 
 	// shared I2C bus
 	const i2c_config_t * i2c_config = config_i2c_get(&i2c_system_port);
